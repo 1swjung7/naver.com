@@ -80,7 +80,7 @@ inputs = processor(text=[text], images=images, return_tensors="pt", padding=True
 with torch.no_grad():
     outputs = vlm_model.generate(
         **inputs,
-        max_new_tokens=150,
+        max_new_tokens=300,
         return_dict_in_generate=True,
         output_scores=True
     )
@@ -154,3 +154,4 @@ print(final)
 # LLM 언로드
 unload_model(llm_model)
 print(">>> LLM 언로드 완료")
+
