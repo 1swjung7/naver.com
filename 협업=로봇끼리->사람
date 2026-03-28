@@ -1,0 +1,308 @@
+# =====================================
+# 3자 협업 Pipeline: Robot A + Robot B + Human
+#
+# 질문 라우팅 우선순위:
+#   1순위: Robot A ↔ Robot B (로봇 간 해결)
+#   2순위: Human query (로봇이 못 풀 때만)
+#
+# 역할:
+#   Robot A (VLM) : Scout — 탐색, 원인 파악
+#   Robot B (LLM) : Cleaner — 청소, 환기
+#   Human         : 최후 결정자 — 맥락·판단 제공
+# =====================================
+
+import gc
+import json
+import torch
+from PIL import Image
+import torch.nn.functional as F
+from transformers import (
+    AutoProcessor,
+    Qwen2_5_VLForConditionalGeneration,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+)
+
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# ── 하이퍼파라미터 ──────────────────────────
+TAU_ROBOT = 0.5   # 로봇 간 통신 트리거 threshold
+TAU_HUMAN = 0.7   # Human query 트리거 threshold (더 높게 설정)
+# TAU_ROBOT < TAU_HUMAN: 로봇끼리 먼저 해결 시도, 그래도 높으면 Human
+
+def unload_model(model):
+    model.cpu()
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def compute_entropy(scores):
+    if not scores:
+        return 0.0
+    entropies = []
+    for step_logits in scores:
+        probs    = F.softmax(step_logits, dim=-1)
+        log_probs = torch.log(probs + 1e-12)
+        entropy  = -(probs * log_probs).sum(dim=-1)
+        entropies.append(entropy.mean().item())
+    return sum(entropies) / len(entropies)
+
+def extract_json(text):
+    start = text.find("{")
+    end   = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        return None
+    try:
+        return json.loads(text[start:end])
+    except json.JSONDecodeError:
+        return None
+
+# =====================================
+# 이미지 로드
+# =====================================
+img1   = Image.open("livingroom.jpg").convert("RGB").resize((224, 224))
+img2   = Image.open("bathroom.jpg").convert("RGB").resize((224, 224))
+images = [img1, img2]
+task   = "The house smells bad. Find the source and clean it up."
+
+# =====================================
+# STEP 1: VLM → 공유 관찰 생성
+# =====================================
+print(">>> [STEP 1] VLM 공유 관찰 생성...")
+vlm_id    = "Qwen/Qwen2.5-VL-3B-Instruct"
+processor = AutoProcessor.from_pretrained(vlm_id)
+vlm_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    vlm_id, torch_dtype=torch.float16,
+).to(device)
+vlm_model.eval()
+
+obs_prompt = f"""
+You see two images: living room and bathroom.
+Task: {task}
+
+Describe ONLY observations (smells, stains, clutter).
+Be factual. Do not suggest actions.
+"""
+messages = [{
+    "role": "user",
+    "content": [
+        {"type": "image", "image": images[0]},
+        {"type": "image", "image": images[1]},
+        {"type": "text",  "text": obs_prompt},
+    ],
+}]
+text   = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = processor(text=[text], images=images, return_tensors="pt", padding=True).to(device)
+
+with torch.no_grad():
+    out = vlm_model.generate(
+        **inputs, max_new_tokens=200,
+        return_dict_in_generate=True, output_scores=True,
+    )
+
+generated   = out.sequences[:, inputs["input_ids"].shape[1]:]
+shared_obs  = processor.batch_decode(generated, skip_special_tokens=True)[0]
+U_obs       = compute_entropy(out.scores or [])
+
+print(f"[Shared Observation]\n{shared_obs}")
+print(f"U_obs: {U_obs:.4f}")
+
+unload_model(vlm_model)
+del processor, inputs, out, generated
+gc.collect(); torch.cuda.empty_cache()
+print(">>> VLM 언로드 완료\n")
+
+# =====================================
+# STEP 2: LLM 로드 → Robot A / B 독립 plan
+# =====================================
+print(">>> [STEP 2] Robot A / B 플랜 생성...")
+llm_id    = "microsoft/Phi-3-mini-4k-instruct"
+tokenizer = AutoTokenizer.from_pretrained(llm_id)
+llm_model = AutoModelForCausalLM.from_pretrained(
+    llm_id, torch_dtype=torch.float16,
+).to(device)
+llm_model.eval()
+
+def run_llm(prompt, max_new_tokens=200):
+    inp = tokenizer(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = llm_model.generate(
+            **inp, max_new_tokens=max_new_tokens,
+            return_dict_in_generate=True, output_scores=True,
+        )
+    new_tok = out.sequences[0][inp["input_ids"].shape[1]:]
+    text    = tokenizer.decode(new_tok, skip_special_tokens=True)
+    U       = compute_entropy(out.scores or [])
+    return text, U
+
+# Robot A: Scout
+plan_a, U_A = run_llm(f"""You are Robot A (Scout).
+Role: Find the odor source only. Do NOT clean.
+Task: {task}
+Observation: {shared_obs}
+Give max 3 investigation steps. Format: step1 | step2 | step3""")
+
+print(f"[Robot A Plan] {plan_a}  (U_A={U_A:.4f})")
+
+# Robot B: Cleaner
+plan_b, U_B = run_llm(f"""You are Robot B (Cleaner).
+Role: Clean and eliminate odor. Do NOT investigate.
+Task: {task}
+Observation: {shared_obs}
+Give max 3 cleaning steps. Format: step1 | step2 | step3""")
+
+print(f"[Robot B Plan] {plan_b}  (U_B={U_B:.4f})\n")
+
+# =====================================
+# STEP 3: 1순위 — Robot 간 통신
+# U > TAU_ROBOT 이면 상대 로봇에게 먼저 질문
+# =====================================
+print(">>> [STEP 3] Robot 간 협업 통신...")
+
+def robot_ask(asker, answerer, asker_plan, answerer_role, obs, task):
+    """asker 로봇이 answerer 로봇에게 질문하고 plan을 업데이트"""
+    q_prompt = f"""You are {answerer} robot.
+{asker} robot is uncertain and asks for your input.
+{asker}'s plan: {asker_plan}
+Observation: {obs}
+Task: {task}
+Answer in 1-2 sentences to help {asker} refine its plan."""
+    answer, _ = run_llm(q_prompt, max_new_tokens=80)
+    return answer
+
+# A가 불확실 → B에게 질문 (Human 개입 없이)
+if U_A > TAU_ROBOT:
+    b_to_a = robot_ask("Robot A", "Robot B (Cleaner)",
+                        plan_a, "cleaning", shared_obs, task)
+    print(f"[A→B] B's answer to A: {b_to_a}")
+
+    plan_a, U_A = run_llm(f"""You are Robot A (Scout).
+Original plan: {plan_a}
+Robot B's input: {b_to_a}
+Revise plan (max 3 steps). Format: step1 | step2 | step3""")
+    print(f"[Robot A Revised] {plan_a}  (U_A={U_A:.4f})")
+
+# B가 불확실 → A에게 질문 (Human 개입 없이)
+if U_B > TAU_ROBOT:
+    a_to_b = robot_ask("Robot B", "Robot A (Scout)",
+                        plan_b, "scouting", shared_obs, task)
+    print(f"[B→A] A's answer to B: {a_to_b}")
+
+    plan_b, U_B = run_llm(f"""You are Robot B (Cleaner).
+Original plan: {plan_b}
+Robot A's input: {a_to_b}
+Revise plan (max 3 steps). Format: step1 | step2 | step3""")
+    print(f"[Robot B Revised] {plan_b}  (U_B={U_B:.4f})\n")
+
+# =====================================
+# STEP 4: 2순위 — Human Query
+# 로봇 간 통신 후에도 U > TAU_HUMAN 이면 Human에게 escalate
+# TAU_HUMAN > TAU_ROBOT 이므로 Human 개입은 최소화됨
+# =====================================
+print(">>> [STEP 4] Human Query 판단...")
+
+human_input = "No human input needed."
+human_queried = False
+
+# A 또는 B 중 하나라도 TAU_HUMAN 초과 시 Human에게 질문
+max_U = max(U_A, U_B)
+if max_U > TAU_HUMAN:
+    # 더 불확실한 쪽이 Human에게 질문 생성
+    uncertain_robot = "Robot A" if U_A >= U_B else "Robot B"
+    uncertain_plan  = plan_a    if U_A >= U_B else plan_b
+
+    hq_prompt = f"""You are {uncertain_robot}.
+Task: {task}
+Your current plan: {uncertain_plan}
+You are still uncertain (U={max_U:.2f}).
+Ask the human ONE critical question that robots cannot resolve alone.
+(e.g. hidden context, user preference, off-scene information)"""
+
+    human_question, _ = run_llm(hq_prompt, max_new_tokens=80)
+    print(f"\n[Human Query by {uncertain_robot}]\n  Q: {human_question}")
+
+    # 실제 환경에서는 여기서 input() 또는 UI로 Human 응답 수신
+    # 시뮬레이션: 자동 응답
+    human_input   = "(Simulated) The garbage bin in the bathroom was not emptied for a week."
+    human_queried = True
+    print(f"  A: {human_input}")
+
+    # Human 답변 → 두 로봇 plan 모두 업데이트
+    plan_a, U_A = run_llm(f"""You are Robot A (Scout).
+Plan: {plan_a}  Human input: {human_input}
+Revise plan (max 3 steps). Format: step1 | step2 | step3""")
+
+    plan_b, U_B = run_llm(f"""You are Robot B (Cleaner).
+Plan: {plan_b}  Human input: {human_input}
+Revise plan (max 3 steps). Format: step1 | step2 | step3""")
+
+    print(f"[Robot A Final] {plan_a}")
+    print(f"[Robot B Final] {plan_b}")
+else:
+    print(f"  Human query 불필요 (max U={max_U:.4f} ≤ TAU_HUMAN={TAU_HUMAN})")
+
+# =====================================
+# STEP 5: Conflict 해소 + 최종 병렬 실행 계획
+# =====================================
+print("\n>>> [STEP 5] Conflict 해소 + 최종 계획 생성...")
+
+conflict_prompt = f"""You are a task coordinator for two robots.
+
+Task: {task}
+Robot A (Scout) plan: {plan_a}
+Robot B (Cleaner) plan: {plan_b}
+
+1. Remove any duplicate or conflicting steps.
+2. Assign each step to Robot A or Robot B.
+3. Mark steps that can run in PARALLEL vs must be SEQUENTIAL.
+
+Output JSON only:
+{{
+  "sequential_first": [
+    {{"robot": "A or B", "step": "<action>"}}
+  ],
+  "parallel": [
+    {{"robot": "A", "step": "<action>"}},
+    {{"robot": "B", "step": "<action>"}}
+  ],
+  "sequential_last": [
+    {{"robot": "A or B", "step": "<action>"}}
+  ]
+}}"""
+
+raw_final, _ = run_llm(conflict_prompt, max_new_tokens=300)
+final_plan   = extract_json(raw_final)
+
+print("\n=== FINAL COLLABORATIVE PLAN ===")
+if final_plan:
+    if final_plan.get("sequential_first"):
+        print("[Sequential first]")
+        for s in final_plan["sequential_first"]:
+            print(f"  [{s['robot']}] {s['step']}")
+    if final_plan.get("parallel"):
+        print("[Parallel execution]")
+        for s in final_plan["parallel"]:
+            print(f"  [{s['robot']}] {s['step']}")
+    if final_plan.get("sequential_last"):
+        print("[Sequential last]")
+        for s in final_plan["sequential_last"]:
+            print(f"  [{s['robot']}] {s['step']}")
+else:
+    print(raw_final)
+
+unload_model(llm_model)
+gc.collect(); torch.cuda.empty_cache()
+print("\n>>> LLM 언로드 완료")
+
+# =====================================
+# 최종 요약
+# =====================================
+print("\n" + "="*50)
+print("PIPELINE SUMMARY")
+print("="*50)
+print(f"Task              : {task}")
+print(f"U_obs             : {U_obs:.4f}")
+print(f"U_A (final)       : {U_A:.4f}")
+print(f"U_B (final)       : {U_B:.4f}")
+print(f"Robot↔Robot 통신  : {'Yes' if max(U_A,U_B) > TAU_ROBOT else 'No'}")
+print(f"Human query 사용  : {'Yes' if human_queried else 'No'}")
